@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb_checkpoints/
+.venv/
+.env
+.env.*.backup
+
+.DS_Store
+.vscode/
+data/raw/*
+!data/raw/.gitkeep
+reports/figures/*
+!reports/figures/.gitkeep
