@@ -1,30 +1,83 @@
+# --- top of file: src/streamlit_app.py ---
 import os
 import json
+import ast
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
-from dotenv import load_dotenv
-
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+# Page config should be one of the first Streamlit calls
+st.set_page_config(page_title="Your Music Taste — Deep Dive", layout="wide")
+
+# Try to load .env locally; ignore if package isn't installed (cloud uses st.secrets)
+try:
+    from dotenv import load_dotenv  # noqa
+    load_dotenv()
+except Exception:
+    pass
+
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+
+# Prefer Streamlit secrets on cloud; fall back to env vars (and .env when available)
+def cfg(key: str, default: str = "") -> str:
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+PUBLIC_URL   = cfg("PUBLIC_URL", "")
+REDIRECT_URI = PUBLIC_URL or cfg("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+SCOPES       = cfg("SPOTIFY_SCOPES", "user-top-read")
+
+def get_sp_client():
+    auth_manager = SpotifyOAuth(
+        client_id=cfg("SPOTIPY_CLIENT_ID"),
+        client_secret=cfg("SPOTIPY_CLIENT_SECRET"),
+        redirect_uri=REDIRECT_URI,
+        scope=SCOPES,
+        cache_path=".cache-streamlit",
+        open_browser=False,
+        show_dialog=False,
+    )
+    # Cloud flow: show login link until we have a 'code' in the query params
+    if PUBLIC_URL:
+        params = st.query_params
+        if "code" in params:
+            auth_manager.get_access_token(params["code"])
+        else:
+            st.markdown(f"[🔐 Connect your Spotify account]({auth_manager.get_authorize_url()})")
+            st.stop()
+    return spotipy.Spotify(auth_manager=auth_manager)
+
 # ---------- Setup ----------
-load_dotenv()
 DATA_DIR = "data/processed"
 
 @st.cache_data
-def load_csv(name):
+def load_csv(name: str, parse_genres: bool = False) -> pd.DataFrame:
+    """Load CSVs from data/processed with optional literal-eval of the 'genres' column."""
     path = os.path.join(DATA_DIR, name)
-    return pd.read_csv(path) if os.path.exists(path) else pd.DataFrame()
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if parse_genres and "genres" in df.columns:
+        df["genres"] = df["genres"].apply(
+            lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith("[") else x
+        )
+    return df
 
-top_artists = load_csv("top_artists.csv")
-top_tracks  = load_csv("top_tracks.csv")
-recent      = load_csv("recently_played.csv")
-saved       = load_csv("saved_tracks.csv")
-features    = load_csv("audio_features.csv")
-artist_genres = load_csv("artist_genres.csv")
+# Load processed data
+top_artists   = load_csv("top_artists.csv")
+top_tracks    = load_csv("top_tracks.csv")
+recent        = load_csv("recently_played.csv")
+saved         = load_csv("saved_tracks.csv")
+features      = load_csv("audio_features.csv")
+artist_genres = load_csv("artist_genres.csv", parse_genres=True)
+
 
 st.set_page_config(page_title="Your Music Taste — Deep Dive", layout="wide")
 
