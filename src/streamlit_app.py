@@ -1,12 +1,18 @@
 # --- top of file: src/streamlit_app.py ---
-import os
-import json
-import ast
+import os, json, ast
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
+
+# Try to import Plotly with a helpful fallback
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+except ModuleNotFoundError as e:
+    st.error("Plotly isn't available in the runtime. Make sure `plotly` is in requirements.txt. "
+             "If you just added it, click Manage app → Reboot.")
+    st.caption(f"Import error: {e!s}")
+    st.stop()
 
 # Page config should be one of the first Streamlit calls
 st.set_page_config(page_title="Your Music Taste — Deep Dive", layout="wide")
