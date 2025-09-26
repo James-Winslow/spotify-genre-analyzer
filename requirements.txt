@@ -1,8 +1,8 @@
+streamlit==1.38.0
 spotipy==2.25.1
 python-dotenv==1.0.1
-matplotlib==3.9.0
-streamlit==1.38.0
 plotly==5.24.1
 pandas==2.2.2
 numpy==2.0.2
 python-dateutil==2.9.0.post0
+matplotlib==3.9.0
