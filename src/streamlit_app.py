@@ -1,307 +1,248 @@
-# --- top of file: src/streamlit_app.py ---
-import os, json, ast
+# src/streamlit_app.py
+import ast
+from pathlib import Path
 import pandas as pd
-import numpy as np
 import streamlit as st
 
-# Try to import Plotly with a helpful fallback
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-except ModuleNotFoundError as e:
-    st.error("Plotly isn't available in the runtime. Make sure `plotly` is in requirements.txt. "
-             "If you just added it, click Manage app → Reboot.")
-    st.caption(f"Import error: {e!s}")
-    st.stop()
+st.set_page_config(page_title="Spotify Genre Analyzer", layout="wide")
+PROC = Path("data/processed")
 
-# Page config should be one of the first Streamlit calls
-st.set_page_config(page_title="Your Music Taste — Deep Dive", layout="wide")
-
-# Try to load .env locally; ignore if package isn't installed (cloud uses st.secrets)
-try:
-    from dotenv import load_dotenv  # noqa
-    load_dotenv()
-except Exception:
-    pass
-
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-
-# Prefer Streamlit secrets on cloud; fall back to env vars (and .env when available)
-def cfg(key: str, default: str = "") -> str:
-    try:
-        if key in st.secrets:
-            return str(st.secrets[key])
-    except Exception:
-        pass
-    return os.getenv(key, default)
-
-PUBLIC_URL   = cfg("PUBLIC_URL", "")
-REDIRECT_URI = PUBLIC_URL or cfg("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
-SCOPES       = cfg("SPOTIFY_SCOPES", "user-top-read")
-
-def get_sp_client():
-    auth_manager = SpotifyOAuth(
-        client_id=cfg("SPOTIPY_CLIENT_ID"),
-        client_secret=cfg("SPOTIPY_CLIENT_SECRET"),
-        redirect_uri=REDIRECT_URI,
-        scope=SCOPES,
-        cache_path=".cache-streamlit",
-        open_browser=False,
-        show_dialog=False,
-    )
-    # Cloud flow: show login link until we have a 'code' in the query params
-    if PUBLIC_URL:
-        params = st.query_params
-        if "code" in params:
-            auth_manager.get_access_token(params["code"])
-        else:
-            st.markdown(f"[🔐 Connect your Spotify account]({auth_manager.get_authorize_url()})")
-            st.stop()
-    return spotipy.Spotify(auth_manager=auth_manager)
-
-# ---------- Setup ----------
-DATA_DIR = "data/processed"
-
-@st.cache_data
-def load_csv(name: str, parse_genres: bool = False) -> pd.DataFrame:
-    """Load CSVs from data/processed with optional literal-eval of the 'genres' column."""
-    path = os.path.join(DATA_DIR, name)
-    if not os.path.exists(path):
+# ---------- helpers ----------
+def load_csv(path: Path, parse_dates=None) -> pd.DataFrame:
+    if not path.exists():
         return pd.DataFrame()
-    df = pd.read_csv(path)
-    if parse_genres and "genres" in df.columns:
-        df["genres"] = df["genres"].apply(
-            lambda x: ast.literal_eval(x) if isinstance(x, str) and x.startswith("[") else x
-        )
-    return df
+    return pd.read_csv(path, parse_dates=parse_dates)
 
-# Load processed data
-top_artists   = load_csv("top_artists.csv")
-top_tracks    = load_csv("top_tracks.csv")
-recent        = load_csv("recently_played.csv")
-saved         = load_csv("saved_tracks.csv")
-features      = load_csv("audio_features.csv")
-artist_genres = load_csv("artist_genres.csv", parse_genres=True)
+def friendly_cols(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {
+        "track_name": "Track Name",
+        "artist_name": "Artist",
+        "album_name": "Album",
+        "played_at": "Played At",
+        "added_at": "Added At",
+        "time_range": "Time Range",
+        "genre": "Genre",
+        "size_all": "Artists in Library",
+        "size_30": "Artists in Last 30 Days",
+        "pct_30": "% of Last 30 Days",
+        "pct_all": "% of Library",
+        "lift": "Lift vs Library",
+    }
+    cols = {c: mapping[c] for c in df.columns if c in mapping}
+    return df.rename(columns=cols)
 
-
-st.set_page_config(page_title="Your Music Taste — Deep Dive", layout="wide")
-
-# ---------- Sidebar Controls ----------
-st.sidebar.title("Controls")
-time_range = st.sidebar.selectbox("Top items time range", ["short_term","medium_term","long_term"], index=1)
-hide_artists = st.sidebar.checkbox("Hide artist names (for sharing)", value=True)
-include_recent = st.sidebar.checkbox("Include Recently Played (last ~1y)", value=True)
-include_saved  = st.sidebar.checkbox("Include Saved Library timeline", value=True)
-top_n_genres = st.sidebar.slider("Top Genres to show", 5, 30, 15)
-min_plays_per_genre = st.sidebar.slider("Min count to include in charts", 1, 20, 3)
-
-st.sidebar.write("---")
-st.sidebar.caption("Tip: refresh data via `python src/fetch_spotify_data.py`")
-
-# ---------- Helpers ----------
-def masked_artist(name, idx):
-    return f"Hidden Artist #{idx+1}" if hide_artists else name
-
-def extract_genre_counts(df_tracks_like, artist_col="artist_id"):
-    if df_tracks_like.empty or artist_genres.empty:
-        return pd.DataFrame(columns=["genre","count"])
-    g = df_tracks_like[[artist_col]].dropna().merge(artist_genres.explode("genres"), on=artist_col, how="left")
-    g = g.rename(columns={"genres":"genre"})
-    g = g.dropna(subset=["genre"])
-    return g.groupby("genre").size().reset_index(name="count").sort_values("count", ascending=False)
-
-def map_features(tracks_df, id_col="track_id"):
-    if tracks_df.empty or features.empty: return pd.DataFrame()
-    f = tracks_df[[id_col]].dropna().merge(features, left_on=id_col, right_on="id", how="left")
-    return f
-
-def polar_radar(avg_dict, title):
-    cats = ["danceability","energy","valence","acousticness","instrumentalness","liveness","speechiness"]
-    vals = [avg_dict.get(k,0) for k in cats]
-    fig = go.Figure(data=go.Scatterpolar(r=vals, theta=cats, fill='toself'))
-    fig.update_layout(title=title, margin=dict(l=20,r=20,t=50,b=20))
-    return fig
-
-def key_mode_heatmap(fdf, title):
-    if fdf.empty: return go.Figure()
-    pivot = fdf.pivot_table(index="key_name", columns="mode_name", values="id", aggfunc="count", fill_value=0)
-    pivot = pivot.reindex(index=["C","C♯/D♭","D","D♯/E♭","E","F","F♯/G♭","G","G♯/A♭","A","A♯/B♭","B"])
-    fig = px.imshow(pivot, text_auto=True, aspect="auto", title=title)
-    return fig
-
-def energy_valence_quadrant(fdf, title):
-    if fdf.empty: return go.Figure()
-    fig = px.scatter(fdf, x="energy", y="valence", hover_name="name", opacity=0.6)
-    fig.add_vline(x=0.5); fig.add_hline(y=0.5)
-    fig.update_layout(title=title, xaxis_title="Energy", yaxis_title="Valence (positivity)")
-    return fig
-
-def bpm_hist(fdf, title):
-    if fdf.empty: return go.Figure()
-    fig = px.histogram(fdf, x="tempo", nbins=40, title=title)
-    fig.update_xaxes(title="Tempo (BPM)")
-    return fig
-
-def genre_over_time(df, time_col, title):
-    if df.empty: return go.Figure()
-    # join genres
-    g = df.merge(artist_genres.explode("genres"), on="artist_id", how="left").rename(columns={"genres":"genre"})
-    g = g.dropna(subset=["genre", time_col])
-    g[time_col] = pd.to_datetime(g[time_col])
-    g["ym"] = g[time_col].dt.to_period("M").dt.to_timestamp()
-    top = g.groupby("genre").size().sort_values(ascending=False).head(15).index
-    g2 = g[g["genre"].isin(top)]
-    counts = g2.groupby(["ym","genre"]).size().reset_index(name="count")
-    fig = px.area(counts, x="ym", y="count", color="genre", title=title)
-    fig.update_xaxes(title="Month")
-    fig.update_yaxes(title="Plays / Adds")
-    return fig
-
-# ---------- Data prep ----------
-# Top entities filtered by range
-ta = top_artists[top_artists["time_range"]==time_range].copy() if not top_artists.empty else pd.DataFrame()
-tt = top_tracks[top_tracks["time_range"]==time_range].copy()  if not top_tracks.empty else pd.DataFrame()
-
-# Mask artist names if requested
-if not ta.empty and "name" in ta.columns:
-    ta = ta.reset_index(drop=True)
-    ta["display_name"] = [masked_artist(n,i) for i,n in enumerate(ta["name"])]
-if not tt.empty:
-    # harmonious column names
-    tt["primary_artist_name"] = tt["artists"].apply(lambda arr: json.loads(arr.replace("'",'"'))[0]["name"] if isinstance(arr,str) and arr.startswith("[") else None) if "artists" in tt else tt.get("name")
-    tt = tt.reset_index(drop=True)
-
-# Audio features join for top tracks
-tt_feats = map_features(tt.rename(columns={"id":"track_id"}), "track_id")
-if not tt_feats.empty:
-    tt_feats["name"] = tt.merge(tt_feats[["id"]], left_on="id", right_on="id", how="left")["name"]
-
-# ---------- Layout ----------
-st.title("🎧 Your Music Taste — Deep Dive")
-st.caption("A private, story-oriented dashboard built from your Spotify data.")
-
-# Row A: Hero metrics
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Top Artists (selected range)", value=0 if ta.empty else len(ta))
-with col2:
-    st.metric("Top Tracks (selected range)", value=0 if tt.empty else len(tt))
-with col3:
-    st.metric("Audio-featured tracks", value=0 if tt_feats.empty else tt_feats["id"].nunique())
-with col4:
-    st.metric("Genres cataloged", value=0 if artist_genres.empty else artist_genres.explode("genres")["genres"].nunique())
-
-st.write("---")
-
-# Row B: Genre snapshot + radar
-left, right = st.columns([1.1, 1.0])
-
-with left:
-    # Genre counts (from top tracks + recent/saved if toggled)
-    pools = []
-    if not tt.empty:
-        # derive artist_id via primary artist; best effort
-        if "artists" in tt.columns:
-            # robust parse
-            def artist_id_first(row):
+def ensure_genre_list(df_gen: pd.DataFrame) -> pd.DataFrame:
+    if df_gen.empty:
+        return df_gen
+    g = df_gen.copy()
+    if "genres" in g.columns:
+        def _to_list(x):
+            if isinstance(x, list):
+                return x
+            if isinstance(x, str):
                 try:
-                    arr = json.loads(row.replace("'",'"'))
-                    return arr[0]["id"]
+                    v = ast.literal_eval(x)
+                    return v if isinstance(v, list) else []
                 except Exception:
-                    return None
-            tt["artist_id"] = tt["artists"].apply(artist_id_first)
-        pools.append(tt[["artist_id"]])
-    if include_recent and not recent.empty:
-        pools.append(recent[["artist_id"]])
-    if include_saved and not saved.empty:
-        pools.append(saved[["artist_id"]])
+                    return [s.strip() for s in x.split(",")] if x else []
+            return []
+        g["genres"] = g["genres"].apply(_to_list)
+    return g
 
-    cat_df = pd.concat(pools, ignore_index=True).dropna() if pools else pd.DataFrame(columns=["artist_id"])
-    genre_counts = extract_genre_counts(cat_df) if not cat_df.empty else pd.DataFrame(columns=["genre","count"])
-    if not genre_counts.empty:
-        genre_counts = genre_counts[genre_counts["count"]>=min_plays_per_genre]
-        fig = px.treemap(genre_counts.head(200), path=["genre"], values="count", title="Your Genre Landscape")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No genres available yet—play or save some tracks and refresh data.")
+def explode_genres(df_tracks: pd.DataFrame, df_genres: pd.DataFrame) -> pd.DataFrame:
+    """Join by artist_id only; explode to genre rows."""
+    if df_tracks.empty or df_genres.empty:
+        return pd.DataFrame(columns=list(df_tracks.columns) + ["genre"])
+    g = ensure_genre_list(df_genres)
+    g = g.explode("genres").rename(columns={"genres": "genre"})
+    # join on artist_id only; keep original artist_name from tracks
+    return (
+        df_tracks.merge(g[["artist_id", "genre"]], on="artist_id", how="left")
+                 .dropna(subset=["genre"])
+    )
 
-with right:
-    # Average audio profile (radar)
-    prof = {}
-    if not tt_feats.empty:
-        for k in ["danceability","energy","valence","acousticness","instrumentalness","liveness","speechiness"]:
-            prof[k] = float(np.nanmean(tt_feats[k])) if k in tt_feats else 0.0
-    st.plotly_chart(polar_radar(prof, "Your Average Audio Profile"), use_container_width=True)
+# ---------- load cached ----------
+recent   = load_csv(PROC / "recently_played.csv", parse_dates=["played_at"])
+saved    = load_csv(PROC / "saved_tracks.csv",     parse_dates=["added_at"])
+genres   = load_csv(PROC / "artist_genres.csv")  # artist_id, artist_name, genres
+features = load_csv(PROC / "audio_features.csv") # optional / may be empty
 
-st.write("---")
+# ---------- header ----------
+st.title("Spotify Wrapped (WIP) – Genre Focus")
+st.caption("Last 30 days vs. all-time, built from your cached CSVs in `data/processed/`.")
 
-# Row C: Tempo + Key/Mode + Mood quad
-c1,c2,c3 = st.columns([1.1,1.0,1.1])
-with c1:
-    st.plotly_chart(bpm_hist(tt_feats, "Most-Listened BPM (Top Tracks)"), use_container_width=True)
-with c2:
-    st.plotly_chart(key_mode_heatmap(tt_feats, "Musical Key × Mode (Top Tracks)"), use_container_width=True)
-with c3:
-    st.plotly_chart(energy_valence_quadrant(tt_feats, "Energy vs Valence — Mood Map"), use_container_width=True)
+with st.expander("Debug: columns present", expanded=False):
+    st.write("recently_played.csv:", list(recent.columns))
+    st.write("saved_tracks.csv:", list(saved.columns))
+    st.write("artist_genres.csv:", list(genres.columns))
+    st.write("audio_features.csv:", list(features.columns))
 
-st.write("---")
-
-# Row D: Evolution over time
-st.subheader("📈 Evolution Over Time")
-cols = st.columns(2)
-with cols[0]:
-    if include_recent and not recent.empty:
-        st.plotly_chart(genre_over_time(recent, "played_at", "Genres Over Time (Recently Played)"), use_container_width=True)
-    else:
-        st.info("Recently Played timeline not included.")
-with cols[1]:
-    if include_saved and not saved.empty:
-        st.plotly_chart(genre_over_time(saved, "added_at", "Genres Over Time (Saved Library)"), use_container_width=True)
-    else:
-        st.info("Saved Library timeline not included.")
-
-st.write("---")
-
-# Row E: Top artists/tracks tables (with hide toggle)
-st.subheader("🎭 Spotlight — without giving it all away")
-a, b = st.columns(2)
-with a:
-    st.markdown("**Top Artists (masked if selected)**")
-    if not ta.empty:
-        view = ta[["display_name","popularity","followers.total","genres"]].rename(columns={
-            "display_name":"artist",
-            "followers.total":"followers"
-        }) if hide_artists else ta[["name","popularity","followers.total","genres"]].rename(columns={
-            "name":"artist",
-            "followers.total":"followers"
-        })
-        st.dataframe(view.head(20), use_container_width=True, hide_index=True)
-    else:
-        st.info("No top artists in this range.")
-
-with b:
-    st.markdown("**Top Tracks (primary artist masked if selected)**")
-    if not tt.empty:
-        # best-effort masking
-        tt_show = tt.copy()
-        if hide_artists:
-            tt_show["primary_artist_name"] = [f"Hidden Artist #{i+1}" for i in range(len(tt_show))]
-        table = tt_show[["name","primary_artist_name","popularity"]].rename(columns={"name":"track","primary_artist_name":"artist"})
-        st.dataframe(table.head(20), use_container_width=True, hide_index=True)
-    else:
-        st.info("No top tracks in this range.")
-
-st.write("---")
-
-# Row F: Smart suggestions (no top-artist leakage)
-st.subheader("🧠 Smart Suggestions You’ll Probably Like (Artist-Safe)")
-st.caption("Based on your audio profile & genres, not just your top artists.")
-if not genre_counts.empty:
-    top_seed_genres = genre_counts.head(5)["genre"].tolist()
-    st.markdown(f"**Seed genres:** {', '.join(top_seed_genres)}")
-    st.markdown("- Use these as prompts for coworkers in your music league.")
+# ---------- 30-day window ----------
+if recent.empty or "played_at" not in recent.columns:
+    st.warning("No recent plays found (or `played_at` column missing). Run the fetch step first.")
+    recent_30 = recent.iloc[0:0]
 else:
-    st.info("No seed genres yet. Refresh after some listening.")
+    cutoff = recent["played_at"].max() - pd.Timedelta(days=30)
+    recent_30 = recent[recent["played_at"] >= cutoff]
 
-st.write("— End —")
+# ---------- genre summary (artist-based) ----------
+lib_art = saved[["artist_id", "artist_name"]].drop_duplicates() if not saved.empty else saved
+lib_art_gen = explode_genres(lib_art, genres)
+lib_counts = (
+    lib_art_gen.groupby("genre")["artist_id"].nunique().rename("size_all")
+    if not lib_art_gen.empty else pd.Series(dtype="int64", name="size_all")
+)
+
+r30_art = recent_30[["artist_id", "artist_name"]].drop_duplicates() if not recent_30.empty else recent_30
+r30_art_gen = explode_genres(r30_art, genres)
+r30_counts = (
+    r30_art_gen.groupby("genre")["artist_id"].nunique().rename("size_30")
+    if not r30_art_gen.empty else pd.Series(dtype="int64", name="size_30")
+)
+
+summary = pd.concat([lib_counts, r30_counts], axis=1).fillna(0)
+if summary.empty:
+    summary = pd.DataFrame(columns=["size_all", "size_30"])
+
+summary = (
+    summary.assign(
+        pct_all=lambda d: (d["size_all"] / d["size_all"].sum()) if d["size_all"].sum() else 0,
+        pct_30=lambda d: (d["size_30"] / d["size_30"].sum()) if d["size_30"].sum() else 0,
+        lift=lambda d: (d["pct_30"] / d["pct_all"]).replace([pd.NA, pd.NaT, float("inf")], 0)
+    )
+    .reset_index()
+    .rename(columns={"index": "genre"})
+)
+
+# ---------- controls ----------
+k = st.sidebar.slider("How many genres to show (by Lift vs Library)", min_value=5, max_value=50, value=20, step=5)
+
+# ---------- top genres table ----------
+st.subheader("Top Genres by Lift (Last 30 Days vs Library)")
+top_genres = summary.sort_values("lift", ascending=False).head(k)
+st.dataframe(
+    friendly_cols(top_genres)[
+        ["Genre", "Artists in Last 30 Days", "% of Last 30 Days", "Artists in Library", "% of Library", "Lift vs Library"]
+    ].style.format({
+        "% of Last 30 Days": "{:.1%}",
+        "% of Library": "{:.1%}",
+        "Lift vs Library": "{:.2f}",
+    }),
+    use_container_width=True,
+)
+
+# ---------- genre drill-down ----------
+if not top_genres.empty and not recent_30.empty:
+    picked_genre = st.selectbox("Drill down to see the tracks behind a genre:", top_genres["genre"])
+    recent_30_tracks = recent_30[["track_id", "track_name", "artist_id", "artist_name", "album_name", "played_at"]]
+    r30_track_gen = explode_genres(recent_30_tracks, genres)
+    r30_track_gen = r30_track_gen[r30_track_gen["genre"] == picked_genre]
+
+    st.markdown(f"### Tracks contributing to **{picked_genre}** in the last 30 days")
+    if r30_track_gen.empty:
+        st.info("No recent plays found for this genre in the last 30 days.")
+    else:
+        t_recent = (
+            r30_track_gen.drop_duplicates(subset=["track_id"])
+                         .rename(columns={
+                             "track_name": "Track Name",
+                             "artist_name": "Artist",
+                             "album_name": "Album",
+                             "played_at": "Played At",
+                         })[["Track Name", "Artist", "Album", "Played At"]]
+                         .sort_values("Played At", ascending=False)
+        )
+        st.dataframe(t_recent, use_container_width=True)
+
+    st.markdown("#### Also-Tagged Genres for These Artists")
+    if r30_track_gen.empty:
+        st.caption("—")
+    else:
+        artists_this = r30_track_gen[["artist_id", "artist_name"]].drop_duplicates()
+
+        # Merge on artist_id; unify artist_name
+        g2 = genres.merge(artists_this, on="artist_id", how="inner", suffixes=("_lib", "_r30"))
+        g2 = ensure_genre_list(g2)
+        # Use the name from recent plays if present, otherwise library name
+        if "artist_name_r30" in g2.columns or "artist_name_lib" in g2.columns:
+            g2["artist_name"] = g2.get("artist_name_r30", pd.Series(index=g2.index)).combine_first(
+                g2.get("artist_name_lib", pd.Series(index=g2.index))
+            )
+
+        also = g2.explode("genres").rename(columns={"genres": "Genre"})
+        also = also[also["Genre"] != picked_genre]
+        also_counts = (
+            also.groupby("Genre")["artist_id"].nunique()
+                .rename("Artists")
+                .reset_index()
+                .sort_values("Artists", ascending=False)
+        )
+        if also_counts.empty:
+            st.caption("(No additional tags for these artists.)")
+        else:
+            st.dataframe(also_counts, use_container_width=True)
+
+# ---------- multi-tag artists (last 30d) ----------
+st.subheader("Artists with Multiple Genre Tags (Last 30 Days)")
+if recent_30.empty or genres.empty:
+    st.caption("No recent plays window or genres to analyze.")
+else:
+    r30_artists = recent_30[["artist_id", "artist_name"]].drop_duplicates()
+    g3 = genres.merge(r30_artists, on="artist_id", how="inner", suffixes=("_lib", "_r30"))
+    g3 = ensure_genre_list(g3)
+
+    # unify artist_name column
+    if "artist_name_r30" in g3.columns or "artist_name_lib" in g3.columns:
+        g3["artist_name"] = g3.get("artist_name_r30", pd.Series(index=g3.index)).combine_first(
+            g3.get("artist_name_lib", pd.Series(index=g3.index))
+        )
+
+    g3["n_tags"] = g3["genres"].apply(lambda lst: len(lst or []))
+    multi = g3[g3["n_tags"] >= 3].copy()
+    if multi.empty:
+        st.caption("(No artists with 3+ tags in the last 30 days.)")
+    else:
+        multi["All Tags"] = multi["genres"].apply(lambda lst: ", ".join(lst) if isinstance(lst, list) else "")
+        multi_view = (
+            multi[["artist_name", "All Tags", "n_tags"]]
+            .drop_duplicates()
+            .rename(columns={"artist_name": "Artist", "n_tags": "# of Tags"})
+            .sort_values("# of Tags", ascending=False)
+        )
+        st.dataframe(multi_view, use_container_width=True)
+
+# ---------- peeks ----------
+with st.expander("Peek: Latest 50 Recent Plays (from cache)"):
+    if recent.empty:
+        st.caption("—")
+    else:
+        st.dataframe(
+            friendly_cols(
+                recent.sort_values("played_at", ascending=False)
+                      .rename(columns={
+                          "track_name": "Track Name",
+                          "artist_name": "Artist",
+                          "album_name": "Album",
+                          "played_at": "Played At",
+                      })
+            )[["Played At", "Track Name", "Artist", "Album"]].head(50),
+            use_container_width=True,
+        )
+
+with st.expander("Peek: Library Stats"):
+    if saved.empty:
+        st.caption("—")
+    else:
+        st.write(f"Saved tracks in library: **{len(saved):,}**")
+        st.dataframe(
+            friendly_cols(
+                saved.sort_values("added_at", ascending=False)
+                     .rename(columns={
+                         "track_name": "Track Name",
+                         "artist_name": "Artist",
+                         "album_name": "Album",
+                         "added_at": "Added At",
+                     })
+            )[["Added At", "Track Name", "Artist", "Album"]].head(50),
+            use_container_width=True,
+        )
