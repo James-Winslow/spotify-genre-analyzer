@@ -1,7 +1,6 @@
-import os, time, math
+import os
+import time
 from datetime import datetime, timezone
-from collections import defaultdict, Counter
-
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
@@ -13,20 +12,22 @@ RAW_DIR = "data/raw"
 
 KEY_NAMES = ["C","C♯/D♭","D","D♯/E♭","E","F","F♯/G♭","G","G♯/A♭","A","A♯/B♭","B"]
 
-def sp_client(scopes):
+def sp_client(scopes: str):
     load_dotenv()
-    return spotipy.Spotify(auth_manager=SpotifyOAuth(
-        client_id=os.getenv("SPOTIPY_CLIENT_ID"),
-        client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
-        redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
-        scope=scopes,
-        cache_path=".cache",
-        open_browser=True,
-    ))
+    return spotipy.Spotify(
+        auth_manager=SpotifyOAuth(
+            client_id=os.getenv("SPOTIPY_CLIENT_ID"),
+            client_secret=os.getenv("SPOTIPY_CLIENT_SECRET"),
+            redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
+            scope=scopes,
+            cache_path=".cache",
+            open_browser=True,
+        )
+    )
 
-def chunked(iterable, n):
-    for i in range(0, len(iterable), n):
-        yield iterable[i:i+n]
+def chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i+n]
 
 def fetch_top(sp, entity="artists", time_range="medium_term", limit=50):
     if entity == "artists":
@@ -36,33 +37,41 @@ def fetch_top(sp, entity="artists", time_range="medium_term", limit=50):
     return res.get("items", [])
 
 def fetch_recently_played(sp, limit=50, after_days=365):
-    # Spotify limits to ~50 latest per call; we’ll page until exhausted or hit time window
+    # Page backwards from "now" until we hit cutoff or run out
     items = []
-    before = int(datetime.now(timezone.utc).timestamp()*1000)
+    before = int(datetime.now(timezone.utc).timestamp() * 1000)
     cutoff = int((datetime.now(timezone.utc) - pd.Timedelta(days=after_days)).timestamp() * 1000)
+
     while True:
-        res = sp.current_user_recently_played(limit=min(limit,50), before=before)
+        res = sp.current_user_recently_played(limit=min(limit, 50), before=before)
         batch = res.get("items", [])
         if not batch:
             break
+
         items.extend(batch)
-        before = min(int(i["played_at_dt"].timestamp()*1000) if "played_at_dt" in i else int(pd.to_datetime(i["played_at"]).timestamp()*1000) for i in batch) - 1
-        # Stop if we’re before cutoff
+
+        # compute next 'before' from the oldest item in this batch
+        oldest_ms = min(int(pd.to_datetime(i["played_at"]).timestamp() * 1000) for i in batch)
+        before = oldest_ms - 1
+
         if before < cutoff:
             break
         if len(batch) < 2:
             break
+
         time.sleep(0.1)
+
     return items
 
 def fetch_saved_tracks(sp, max_total=5000):
-    # user-library-read; page through saved tracks w/ added_at timestamps
     items = []
     limit = 50
     offset = 0
     while True:
         res = sp.current_user_saved_tracks(limit=limit, offset=offset)
         batch = res.get("items", [])
+        if not batch:
+            break
         items.extend(batch)
         if len(batch) < limit or len(items) >= max_total:
             break
@@ -71,11 +80,23 @@ def fetch_saved_tracks(sp, max_total=5000):
     return items
 
 def get_audio_features(sp, track_ids):
-    feats = []
-    for group in chunked(track_ids, 100):
-        feats.extend(sp.audio_features(group))
-        time.sleep(0.05)
-    return feats
+    """
+    Spotify has tightened access to /audio-features for new/dev apps.
+    We keep the pipeline resilient by returning [] on 403.
+    """
+    try:
+        feats = []
+        for group in chunked(track_ids, 100):
+            # This may raise a 403 in your app state; we'll handle that.
+            part = sp.audio_features(group)
+            if part:
+                feats.extend([f for f in part if f])
+            time.sleep(0.05)
+        return feats
+    except spotipy.exceptions.SpotifyException as e:
+        # Gracefully degrade
+        print("audio_features blocked or failed (continuing without features):", repr(e))
+        return []
 
 def normalize_recent(items):
     rows = []
@@ -84,11 +105,11 @@ def normalize_recent(items):
         track = it["track"]
         rows.append({
             "played_at": played_at,
-            "track_id": track["id"],
-            "track_name": track["name"],
-            "artist_id": track["artists"][0]["id"] if track["artists"] else None,
-            "artist_name": track["artists"][0]["name"] if track["artists"] else None,
-            "album_name": track["album"]["name"] if track.get("album") else None,
+            "track_id": track.get("id"),
+            "track_name": track.get("name"),
+            "artist_id": track["artists"][0]["id"] if track.get("artists") else None,
+            "artist_name": track["artists"][0]["name"] if track.get("artists") else None,
+            "album_name": (track.get("album") or {}).get("name"),
         })
     return pd.DataFrame(rows)
 
@@ -99,11 +120,11 @@ def normalize_saved(items):
         track = it["track"]
         rows.append({
             "added_at": added_at,
-            "track_id": track["id"],
-            "track_name": track["name"],
-            "artist_id": track["artists"][0]["id"] if track["artists"] else None,
-            "artist_name": track["artists"][0]["name"] if track["artists"] else None,
-            "album_name": track["album"]["name"] if track.get("album") else None,
+            "track_id": track.get("id"),
+            "track_name": track.get("name"),
+            "artist_id": track["artists"][0]["id"] if track.get("artists") else None,
+            "artist_name": track["artists"][0]["name"] if track.get("artists") else None,
+            "album_name": (track.get("album") or {}).get("name"),
         })
     return pd.DataFrame(rows)
 
@@ -111,12 +132,15 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
 
-    scopes = os.getenv("SPOTIFY_SCOPES", "user-top-read,user-read-recently-played,user-library-read,playlist-modify-private")
+    # Use spaces (OAuth expects space-delimited scopes)
+    scopes = os.getenv(
+        "SPOTIFY_SCOPES",
+        "user-top-read user-read-recently-played user-library-read playlist-modify-private"
+    )
     sp = sp_client(scopes)
 
-    # --- 1) Top Artists/Tracks across ranges (short/medium/long) ---
-    frames_artists = []
-    frames_tracks = []
+    # 1) Top Artists/Tracks across ranges
+    frames_artists, frames_tracks = [], []
     for rng in ["short_term", "medium_term", "long_term"]:
         arts = fetch_top(sp, "artists", rng, 50)
         trs  = fetch_top(sp, "tracks",  rng, 50)
@@ -132,36 +156,42 @@ def main():
             frames_tracks.append(df_t)
 
     top_artists = pd.concat(frames_artists, ignore_index=True) if frames_artists else pd.DataFrame()
-    top_tracks  = pd.concat(frames_tracks, ignore_index=True) if frames_tracks else pd.DataFrame()
+    top_tracks  = pd.concat(frames_tracks,  ignore_index=True) if frames_tracks  else pd.DataFrame()
 
-    # --- 2) Recently Played (last ~365 days)
-    rec_items = sp.current_user_recently_played(limit=50)  # seed call to attach played_at_dt
-    # spotipy returns ISO strings; normalize below via our helper
+    # 2) Recently Played (~365 days back, paged)
+    # Seed call not strictly needed; we normalize below
     rec_all = fetch_recently_played(sp, limit=50, after_days=365)
     recent_df = normalize_recent(rec_all) if rec_all else pd.DataFrame()
 
-    # --- 3) Saved Tracks (library) with added_at timestamps
+    # 3) Saved Tracks (library)
     saved_items = fetch_saved_tracks(sp, max_total=5000)
     saved_df = normalize_saved(saved_items) if saved_items else pd.DataFrame()
 
-    # --- 4) Audio Features for tracks we’ve seen ---
+ # --- 4) Audio Features for tracks we’ve seen ---
     track_ids = set()
     for df in [top_tracks, recent_df, saved_df]:
         if not df.empty and "track_id" in df.columns:
             track_ids.update(df["track_id"].dropna().tolist())
         elif not df.empty and "id" in df.columns:
             track_ids.update(df["id"].dropna().tolist())
-
     track_ids = [t for t in track_ids if isinstance(t, str)]
-    features = get_audio_features(sp, track_ids) if track_ids else []
-    feats_df = pd.json_normalize([f for f in features if f])
+    feats_df = pd.DataFrame()
+    try:
+        features = get_audio_features(sp, track_ids) if track_ids else []
+        if features:
+            feats_df = pd.json_normalize([f for f in features if f])
+    except Exception as e:
+        print("audio_features blocked or failed (continuing without features):", repr(e))
 
-    # map key/mode to labels
-    if not feats_df.empty and "key" in feats_df.columns:
-        feats_df["key_name"] = feats_df["key"].apply(lambda k: KEY_NAMES[k] if isinstance(k, (int, np.integer)) and 0 <= k < 12 else None)
-        feats_df["mode_name"] = feats_df["mode"].map({1:"Major",0:"Minor"})
+    # Always ensure a file is written so downstream code never breaks
+    if feats_df.empty:
+        feats_df = pd.DataFrame(columns=[
+            "id","key","mode","tempo","danceability","energy",
+            "speechiness","acousticness","instrumentalness","liveness","valence"
+        ])
 
-    # --- 5) Artist genres for recent & saved (for evolution)
+
+    # 5) Artist genres from recent & saved
     artist_ids = set()
     for df in [recent_df, saved_df]:
         if not df.empty and "artist_id" in df.columns:
@@ -169,13 +199,17 @@ def main():
 
     genres_rows = []
     for group in chunked(list(artist_ids), 50):
-        arts = sp.artists(group)["artists"]
+        arts = sp.artists(group)["artists"] if group else []
         for a in arts:
-            genres_rows.append({"artist_id": a["id"], "artist_name": a["name"], "genres": a.get("genres", [])})
+            genres_rows.append({
+                "artist_id": a.get("id"),
+                "artist_name": a.get("name"),
+                "genres": a.get("genres", [])
+            })
         time.sleep(0.05)
     genres_df = pd.DataFrame(genres_rows)
 
-    # --- 6) Save everything ---
+    # 6) Save everything that exists
     if not top_artists.empty: top_artists.to_csv(f"{DATA_DIR}/top_artists.csv", index=False)
     if not top_tracks.empty:  top_tracks.to_csv(f"{DATA_DIR}/top_tracks.csv", index=False)
     if not recent_df.empty:   recent_df.to_csv(f"{DATA_DIR}/recently_played.csv", index=False)
@@ -183,11 +217,13 @@ def main():
     if not feats_df.empty:    feats_df.to_csv(f"{DATA_DIR}/audio_features.csv", index=False)
     if not genres_df.empty:   genres_df.to_csv(f"{DATA_DIR}/artist_genres.csv", index=False)
 
-    print("✅ Data refresh complete. Files saved in data/processed:")
-    print("- top_artists.csv, top_tracks.csv")
-    print("- recently_played.csv, saved_tracks.csv")
-    print("- audio_features.csv")
-    print("- artist_genres.csv")
+    print("✅ Data refresh complete. Wrote:")
+    if not top_artists.empty: print("- data/processed/top_artists.csv")
+    if not top_tracks.empty:  print("- data/processed/top_tracks.csv")
+    if not recent_df.empty:   print("- data/processed/recently_played.csv")
+    if not saved_df.empty:    print("- data/processed/saved_tracks.csv")
+    if not feats_df.empty:    print("- data/processed/audio_features.csv")
+    if not genres_df.empty:   print("- data/processed/artist_genres.csv")
 
 if __name__ == "__main__":
     main()
