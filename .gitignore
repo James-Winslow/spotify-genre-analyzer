@@ -16,3 +16,17 @@ reports/figures/*
 
 # Spotipy token cache
 .cache*
+
+
+# virtualenv / caches
+.venv/
+.cache*
+__pycache__/
+*.pyc
+
+# local data + tokens
+data/raw/
+data/processed/*
+!.gitkeep
+.env
+
